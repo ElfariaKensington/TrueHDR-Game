@@ -116,6 +116,10 @@ static void MaybeWriteStatus(uint32_t width,
     gLastStatusWrite = now;
     os_unfair_lock_unlock(&gHookLock);
 
+    // Disk I/O off the render thread (it previously stalled a frame every second).
+    static dispatch_queue_t statusQ = dispatch_queue_create("truehdr.status", DISPATCH_QUEUE_SERIAL);
+    BOOL active = s.enabled && s.hdrEnabled;
+    dispatch_async(statusQ, ^{ @autoreleasepool {
     NSString *appName = [[NSProcessInfo processInfo] processName] ?: @"Game";
     NSString *dir = ExpandPath(TRUEHDR_CONFIG_DIR);
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -127,7 +131,7 @@ static void MaybeWriteStatus(uint32_t width,
         @"outputWidth": @(outWidth),
         @"outputHeight": @(outHeight),
         @"pixelFormat": @(fmt),
-        @"active": @(s.enabled && s.hdrEnabled),
+        @"active": @(active),
         @"upscaleActive": @(upscaleActive),
         @"upscaleMode": @(TrueHDRUpscaleModeKey(upscaleMode)),
         @"gpuMs": @(gpuMs),
@@ -140,6 +144,7 @@ static void MaybeWriteStatus(uint32_t width,
                                              (__bridge CFStringRef)TRUEHDR_NOTIFY_STAT,
                                              NULL, NULL, TRUE);
     }
+    }});
 }
 
 static void RegisterLayer(CAMetalLayer *layer) {
@@ -184,8 +189,9 @@ static void (*orig_presentDrawableAtTime)(id, SEL, id<MTLDrawable>, CFTimeInterv
 static void (*orig_presentDrawableAfterMinDur)(id, SEL, id<MTLDrawable>, CFTimeInterval) = nullptr;
 static void (*orig_mtl4SignalDrawable)(id, SEL, id) = nullptr;
 static void (*orig_mtl4WaitForDrawable)(id, SEL, id) = nullptr;
-static id (*orig_newMTL4Queue)(id, SEL) = nullptr;
-static id (*orig_newMTL4QueueDesc)(id, SEL, id, NSError **) = nullptr;
+// `new*` methods return +1; the annotations keep ARC ownership balanced through the swizzle.
+static NS_RETURNS_RETAINED id (*orig_newMTL4Queue)(id, SEL) = nullptr;
+static NS_RETURNS_RETAINED id (*orig_newMTL4QueueDesc)(id, SEL, id, NSError **) = nullptr;
 static NSMapTable<id<MTLDevice>, id<MTLEvent>> *gDeviceEvents = nil;
 static NSMutableSet<Class> *gHookedMTL4QueueClasses = nil;
 static atomic_uint_fast64_t gEventSeq = 0;
@@ -223,6 +229,9 @@ static id<MTLEvent> GetEventForDevice(id<MTLDevice> dev) {
 
 static void EncodeProxyIntoCommandBuffer(id<MTLCommandBuffer> cb, TrueHDRDrawable *proxy) {
     if (!cb || !proxy) return;
+    // Game/Wine render threads often have no draining autorelease pool; keep per-frame
+    // encoders/descriptors from piling up for the life of the process.
+    @autoreleasepool {
     if (proxy.waitEvent && proxy.waitValue > 0) {
         [cb encodeWaitForEvent:proxy.waitEvent value:proxy.waitValue];
         proxy.waitEvent = nil;
@@ -244,6 +253,7 @@ static void EncodeProxyIntoCommandBuffer(id<MTLCommandBuffer> cb, TrueHDRDrawabl
                      proxy.ctx.lastUpscaleMode,
                      proxy.ctx.lastGpuMs,
                      s);
+    }
 }
 
 static id<MTLCommandQueue> GetQueueForDevice(id<MTLDevice> dev) {
@@ -302,6 +312,7 @@ static id<MTLCommandQueue> GetQueueForDevice(id<MTLDevice> dev) {
         loggedPresent = YES;
         THLog(@"encodeAndPresentWithMode mode=%d waitVal=%llu fmt=%lu", mode, _waitValue, (unsigned long)_ctx.desiredPixelFormat);
     }
+    @autoreleasepool {
     id<MTLDevice> dev = _gameTexture.device ?: _realDrawable.texture.device;
     id<MTLCommandQueue> q = GetQueueForDevice(dev);
     if (!q) {
@@ -329,6 +340,7 @@ static id<MTLCommandQueue> GetQueueForDevice(id<MTLDevice> dev) {
         [cb presentDrawable:_realDrawable];
     }
     [cb commit];
+    }
 }
 
 - (void)present {
@@ -455,20 +467,33 @@ static void HookMTL4QueueInstance(id queue) {
     }
 }
 
-static id th_newMTL4Queue(id self, SEL _cmd) {
+static NS_RETURNS_RETAINED id th_newMTL4Queue(id self, SEL _cmd) {
     id q = orig_newMTL4Queue(self, _cmd);
     HookMTL4QueueInstance(q);
     return q;
 }
 
-static id th_newMTL4QueueDesc(id self, SEL _cmd, id desc, NSError **err) {
+static NS_RETURNS_RETAINED id th_newMTL4QueueDesc(id self, SEL _cmd, id desc, NSError **err) {
     id q = orig_newMTL4QueueDesc(self, _cmd, desc, err);
     HookMTL4QueueInstance(q);
     return q;
 }
 
+static NSHashTable *gProbedDevices = nil;
+
+// Called from nextDrawable every frame: must be a no-op after the first call per device.
+// (Previously it created a new MTL4CommandQueue + MTLCommandBuffer every frame and leaked the
+// queue, which grew GPU/driver memory without bound and corrupted textures / froze games.)
 static void HookMetalClassesForDevice(id<MTLDevice> dev) {
     if (!dev) return;
+    os_unfair_lock_lock(&gHookLock);
+    if (!gProbedDevices) gProbedDevices = [NSHashTable weakObjectsHashTable];
+    BOOL alreadyProbed = [gProbedDevices containsObject:dev];
+    if (!alreadyProbed) [gProbedDevices addObject:dev];
+    os_unfair_lock_unlock(&gHookLock);
+    if (alreadyProbed) return;
+
+    @autoreleasepool {
     Class devCls = [dev class];
     os_unfair_lock_lock(&gHookLock);
     if (!gHookedDeviceClasses) gHookedDeviceClasses = [NSMutableSet set];
@@ -484,7 +509,8 @@ static void HookMetalClassesForDevice(id<MTLDevice> dev) {
     }
 
     if ([dev respondsToSelector:@selector(newMTL4CommandQueue)]) {
-        id q4 = ((id (*)(id, SEL))objc_msgSend)(dev, @selector(newMTL4CommandQueue));
+        // `new` returns +1; tell ARC so the probe queue is released right after hooking its class.
+        id q4 = ((NS_RETURNS_RETAINED id (*)(id, SEL))objc_msgSend)(dev, @selector(newMTL4CommandQueue));
         HookMTL4QueueInstance(q4);
     }
 
@@ -507,6 +533,7 @@ static void HookMetalClassesForDevice(id<MTLDevice> dev) {
         Method p3 = class_getInstanceMethod(cbCls, @selector(presentDrawable:afterMinimumDuration:));
         if (p3) orig_presentDrawableAfterMinDur = (decltype(orig_presentDrawableAfterMinDur))method_setImplementation(p3, (IMP)th_presentDrawableAfterMinDur);
         THLog(@"Hooked cmdBuf class %@ (p1=%p p2=%p p3=%p)", NSStringFromClass(cbCls), p1, p2, p3);
+    }
     }
 }
 
@@ -1233,11 +1260,11 @@ static void HandleGLFlush(id self, SEL _cmd, void (*origFn)(id, SEL)) {
 }
 
 static void th_glFlushBuffer(id self, SEL _cmd) {
-    HandleGLFlush(self, _cmd, orig_glFlushBuffer);
+    @autoreleasepool { HandleGLFlush(self, _cmd, orig_glFlushBuffer); }
 }
 
 static void th_wineGlFlushBuffer(id self, SEL _cmd) {
-    HandleGLFlush(self, _cmd, orig_wineGlFlushBuffer);
+    @autoreleasepool { HandleGLFlush(self, _cmd, orig_wineGlFlushBuffer); }
 }
 
 static void HookWineOpenGLContextIfNeeded(void) {
